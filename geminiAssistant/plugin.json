@@ -1,0 +1,28 @@
+{
+  "id": "geminiAssistant",
+  "name": "Gemini Assistant",
+  "description": "Lightweight Gemini AI assistant with vision & Niri screenshots",
+  "version": "1.0.0",
+  "author": "lki",
+  "icon": "auto_awesome",
+  "type": "widget",
+  "component": "./GeminiWidget.qml",
+  "settings": "./GeminiSettings.qml",
+  "capabilities": [
+    "dankbar-widget"
+  ],
+  "compositors": [
+    "any"
+  ],
+  "distro": [
+    "any"
+  ],
+  "dependencies": [
+    "grim",
+    "wl-clipboard"
+  ],
+  "permissions": [
+    "settings_read",
+    "settings_write"
+  ]
+}
