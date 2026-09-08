@@ -16,11 +16,11 @@ PluginComponent {
     property bool isRequesting: false
     property bool isProcessingFile: false
 
-    // Dynamic Sizing Properties
-    property int customWidth: 460
-    property int customHeight: 250
+    // Window Sizing
+    property int userWidth: 460
+    property int userHeight: 540
     property bool isMaximized: false
-    property bool hasUserResized: false
+    property bool hasManualResize: false
 
     // Attachment State
     property bool hasAttachment: false
@@ -28,7 +28,7 @@ PluginComponent {
     property string attachedFileSize: ""
     property string attachedMimeType: ""
     property string attachedImagePath: ""
-    property string attachedBase64: ""
+    property string currentBase64Payload: ""
     property bool attachedIsImage: false
     property string copyFeedback: ""
 
@@ -42,32 +42,49 @@ PluginComponent {
         onLoaded: {
             try {
                 root.configData = JSON.parse(text());
-            } catch (e) {}
+            } catch (e) {
+                appendSystemError("Failed to parse config file: " + e.message);
+            }
         }
     }
 
-    // Reads the JSON payload created by attach_helper.py
+    // Network Request Timeout Watchdog (30 seconds)
+    Timer {
+        id: requestTimeoutTimer
+        interval: 30000
+        repeat: false
+        onTriggered: {
+            if (root.isRequesting) {
+                root.isRequesting = false;
+                appendSystemError("Request timed out. Google's servers took too long to respond. Please check your internet connection.");
+            }
+        }
+    }
+
+    // Reads atomic JSON output from attach_helper.py
     FileView {
         id: attachmentJsonReader
         watchChanges: true
         onLoaded: {
             try {
-                var data = JSON.parse(text());
-                root.attachedFileName = data.name;
-                root.attachedFileSize = data.size;
-                root.attachedMimeType = data.mime;
-                root.attachedIsImage = data.isImage;
+                var content = text().trim();
+                if (!content) return;
+                var data = JSON.parse(content);
+                root.attachedFileName = data.name || "Attached File";
+                root.attachedFileSize = data.size || "Unknown size";
+                root.attachedMimeType = data.mime || "application/octet-stream";
+                root.attachedIsImage = !!data.isImage;
                 root.attachedImagePath = data.imagePath || "";
-                root.attachedBase64 = data.b64;
+                root.currentBase64Payload = data.b64 || "";
                 root.hasAttachment = true;
                 root.isProcessingFile = false;
             } catch (e) {
                 root.isProcessingFile = false;
+                appendSystemError("Attachment read error: " + e.message);
             }
         }
     }
 
-    // Native Wayland File Picker
     FileDialog {
         id: filePicker
         title: "Select file to attach to Gemini"
@@ -77,6 +94,9 @@ PluginComponent {
                 path = decodeURIComponent(path.substring(7));
             }
             processFileWithPython(path);
+        }
+        onRejected: {
+            root.isProcessingFile = false;
         }
     }
 
@@ -88,18 +108,22 @@ PluginComponent {
                 attachmentJsonReader.path = "/tmp/dms_gemini_attach.json";
             } else {
                 root.isProcessingFile = false;
-                appendMessage("System", "Could not process file.", null);
+                if (code === 127) {
+                    appendSystemError("Python 3 was not found on your system. Please install python.");
+                } else {
+                    appendSystemError("File helper failed (code " + code + "). Ensure attach_helper.py has execute permissions: chmod +x ~/.config/DankMaterialShell/plugins/geminiAssistant/attach_helper.py");
+                }
             }
         }
     }
 
     function processFileWithPython(filePath) {
+        if (!filePath) return;
         root.isProcessingFile = true;
         var helper = Quickshell.env("HOME") + "/.config/DankMaterialShell/plugins/geminiAssistant/attach_helper.py";
         pythonAttachProc.exec([helper, filePath]);
     }
 
-    // Screenshot Process (📸)
     Process {
         id: fullScreenProc
         onExited: (code, status) => {
@@ -107,7 +131,7 @@ PluginComponent {
                 processFileWithPython("/tmp/dms_gemini_shot.jpg");
             } else {
                 root.isProcessingFile = false;
-                appendMessage("System", "Screenshot capture failed.", null);
+                appendSystemError("Screen capture failed (code " + code + "). Ensure 'grim' is installed on your system.");
             }
         }
     }
@@ -124,7 +148,7 @@ PluginComponent {
         root.attachedFileSize = "";
         root.attachedMimeType = "";
         root.attachedImagePath = "";
-        root.attachedBase64 = "";
+        root.currentBase64Payload = "";
         root.attachedIsImage = false;
     }
 
@@ -133,10 +157,14 @@ PluginComponent {
     }
 
     function saveApiKeyDirectly(key) {
+        if (!key || key.length < 15) {
+            appendSystemError("Invalid API key format. Google AI Studio keys typically begin with 'AIzaSy'.");
+            return;
+        }
         root.configData.apiKey = key;
         var jsonStr = JSON.stringify(root.configData, null, 2);
         saveKeyProcess.exec(["sh", "-c", "printf '%s' " + Qt.btoa(jsonStr) + " | base64 -d > " + root.configPath]);
-        appendMessage("System", "✓ API key saved successfully!", null);
+        appendMessage("System", "✓ API key saved successfully!", null, false);
     }
 
     Process {
@@ -144,6 +172,7 @@ PluginComponent {
     }
 
     function copyToClipboard(content, index) {
+        if (!content) return;
         copyProcess.exec(["sh", "-c", "printf '%s' " + Qt.btoa(content) + " | base64 -d | wl-copy"]);
         root.copyFeedback = "copied_" + index;
         feedbackTimer.restart();
@@ -153,6 +182,37 @@ PluginComponent {
         id: feedbackTimer
         interval: 1800
         onTriggered: root.copyFeedback = ""
+    }
+
+    function appendSystemError(errorText) {
+        appendMessage("Error", errorText, null, true);
+    }
+
+    function parseGeminiError(status, responseText) {
+        if (status === 0) {
+            return "Cannot reach Google's servers. Please check your internet connection or DNS settings.";
+        }
+        if (status === 401 || status === 403) {
+            return "Invalid or unauthorized API key (HTTP " + status + "). Set your key with: /key YOUR_API_KEY";
+        }
+        if (status === 404) {
+            return "Model not found (HTTP 404). Update your model name in ~/.config/DankMaterialShell/gemini_config.json to 'gemini-3.6-flash'.";
+        }
+        if (status === 429) {
+            return "Rate limit / Quota exceeded (HTTP 429). You have hit Google's free-tier rate limit. Please wait a moment.";
+        }
+        if (status >= 500) {
+            return "Google Gemini servers are temporarily unavailable (HTTP " + status + "). Please try again in a few seconds.";
+        }
+
+        try {
+            var parsed = JSON.parse(responseText);
+            if (parsed && parsed.error && parsed.error.message) {
+                return "API Error (" + status + "): " + parsed.error.message;
+            }
+        } catch (e) {}
+
+        return "HTTP Error " + status + ": " + responseText.substring(0, 200);
     }
 
     function sendPrompt(inputRef) {
@@ -168,49 +228,53 @@ PluginComponent {
 
         var apiKey = (root.configData && root.configData.apiKey) ? root.configData.apiKey.trim() : "";
         if (!apiKey) {
-            appendMessage("System", "Please set your API key: /key YOUR_KEY", null);
+            appendSystemError("No API key configured. Enter your Google AI Studio key by typing: /key YOUR_API_KEY");
             return;
         }
 
-        var modelName = (root.configData && root.configData.model) ? root.configData.model : "gemini-3.6-flash";
+        var modelName = (root.configData && root.configData.model) ? root.configData.model.trim() : "gemini-3.6-flash";
         var promptText = text !== "" ? text : "Please examine and explain this attached file.";
 
-        var sentAttachmentInfo = null;
-        if (root.hasAttachment && root.attachedBase64 !== "") {
-            sentAttachmentInfo = {
+        var uiAttachment = null;
+        var userParts = [];
+
+        if (root.hasAttachment && root.currentBase64Payload !== "") {
+            userParts.push({
+                "inlineData": {
+                    "mimeType": root.attachedMimeType || "application/octet-stream",
+                    "data": root.currentBase64Payload
+                }
+            });
+
+            uiAttachment = {
                 "name": root.attachedFileName,
                 "size": root.attachedFileSize,
-                "mime": root.attachedMimeType || "application/octet-stream",
                 "isImage": root.attachedIsImage,
-                "imagePath": root.attachedImagePath,
-                "b64": root.attachedBase64
+                "imagePath": root.attachedImagePath
             };
+
             discardAttachment();
         }
 
-        appendMessage("User", promptText, sentAttachmentInfo);
+        userParts.push({ "text": promptText });
+
+        appendMessage("User", promptText, uiAttachment, false);
         inputRef.text = "";
         root.isRequesting = true;
+        requestTimeoutTimer.restart();
 
         var contentsPayload = [];
-        for (var i = 0; i < root.chatHistory.length; i++) {
+        for (var i = 0; i < root.chatHistory.length - 1; i++) {
             var entry = root.chatHistory[i];
+            if (entry.isError) continue;
             if (entry.sender === "User") {
-                var userParts = [];
-                if (entry.attachment && entry.attachment.b64) {
-                    userParts.push({
-                        "inlineData": {
-                            "mimeType": entry.attachment.mime,
-                            "data": entry.attachment.b64
-                        }
-                    });
-                }
-                userParts.push({ "text": entry.text });
-                contentsPayload.push({ "role": "user", "parts": userParts });
+                contentsPayload.push({ "role": "user", "parts": [{ "text": entry.text }] });
             } else if (entry.sender === "Gemini") {
                 contentsPayload.push({ "role": "model", "parts": [{ "text": entry.text }] });
             }
         }
+
+        contentsPayload.push({ "role": "user", "parts": userParts });
 
         var reqBody = {
             "contents": contentsPayload,
@@ -220,34 +284,68 @@ PluginComponent {
         };
 
         var xhr = new XMLHttpRequest();
-        var url = "https://generativelanguage.googleapis.com/v1beta/models/" + modelName + ":generateContent?key=" + apiKey;
+        var url = "https://generativelanguage.googleapis.com/v1beta/models/" + encodeURIComponent(modelName) + ":generateContent?key=" + encodeURIComponent(apiKey);
 
         xhr.open("POST", url, true);
         xhr.setRequestHeader("Content-Type", "application/json");
 
+        xhr.onerror = function() {
+            requestTimeoutTimer.stop();
+            root.isRequesting = false;
+            appendSystemError("Network error: Could not establish connection to Google AI API.");
+        };
+
         xhr.onreadystatechange = function() {
             if (xhr.readyState === XMLHttpRequest.DONE) {
+                requestTimeoutTimer.stop();
                 root.isRequesting = false;
                 if (xhr.status === 200) {
                     try {
                         var res = JSON.parse(xhr.responseText);
-                        var reply = res.candidates[0].content.parts[0].text;
-                        appendMessage("Gemini", reply, null);
+                        if (res.candidates && res.candidates.length > 0) {
+                            var candidate = res.candidates[0];
+                            if (candidate.finishReason === "SAFETY") {
+                                appendSystemError("The response was blocked by Google's safety guidelines.");
+                                return;
+                            }
+                            if (candidate.content && candidate.content.parts && candidate.content.parts.length > 0) {
+                                var reply = candidate.content.parts[0].text;
+                                appendMessage("Gemini", reply, null, false);
+                                return;
+                            }
+                        }
+                        if (res.promptFeedback && res.promptFeedback.blockReason) {
+                            appendSystemError("Prompt was blocked by Google: " + res.promptFeedback.blockReason);
+                            return;
+                        }
+                        appendSystemError("Received an empty response from Gemini.");
                     } catch (e) {
-                        appendMessage("Error", "Parsing error: " + e.message, null);
+                        appendSystemError("Failed to parse API response: " + e.message);
                     }
                 } else {
-                    appendMessage("Error", "HTTP " + xhr.status + ": " + xhr.responseText, null);
+                    var errorMsg = parseGeminiError(xhr.status, xhr.responseText);
+                    appendSystemError(errorMsg);
                 }
             }
         };
 
-        xhr.send(JSON.stringify(reqBody));
+        try {
+            xhr.send(JSON.stringify(reqBody));
+        } catch (err) {
+            requestTimeoutTimer.stop();
+            root.isRequesting = false;
+            appendSystemError("Request dispatch failed: " + err.message);
+        }
     }
 
-    function appendMessage(sender, text, attachment) {
+    function appendMessage(sender, text, attachment, isError) {
         var updated = root.chatHistory.slice();
-        updated.push({ "sender": sender, "text": text, "attachment": attachment });
+        updated.push({
+            "sender": sender,
+            "text": text,
+            "attachment": attachment,
+            "isError": !!isError
+        });
         root.chatHistory = updated;
     }
 
@@ -292,41 +390,29 @@ PluginComponent {
         }
     }
 
-    // Popout Card with Dynamic Width & Height
+    // Stable Popout Card
     popoutContent: Component {
         Rectangle {
-            id: cardContainer
-
-            // Calculate dynamic height: compact when empty, expands with conversation
-            readonly property int naturalHeight: root.chatHistory.length === 0 
-                ? (root.hasAttachment ? 290 : 230)
-                : 580
+            id: mainCard
 
             implicitWidth: root.isMaximized 
                 ? 720 
-                : (root.hasUserResized ? root.customWidth : 460)
+                : (root.hasManualResize ? root.userWidth : 460)
 
             implicitHeight: root.isMaximized 
-                ? 780 
-                : (root.hasUserResized ? root.customHeight : naturalHeight)
-
-            Behavior on implicitWidth {
-                NumberAnimation { duration: 180; easing.type: Easing.OutCubic }
-            }
-            Behavior on implicitHeight {
-                NumberAnimation { duration: 220; easing.type: Easing.OutCubic }
-            }
+                ? 800 
+                : (root.hasManualResize ? root.userHeight : (root.chatHistory.length === 0 && !root.hasAttachment ? 220 : 540))
 
             color: Theme.surfaceContainer
-            radius: 20
-            border.color: Qt.rgba(Theme.outline.r, Theme.outline.g, Theme.outline.b, 0.25)
+            radius: 22
+            border.color: Qt.rgba(Theme.outline.r, Theme.outline.g, Theme.outline.b, 0.2)
             border.width: 1
             clip: true
 
             ColumnLayout {
                 anchors.fill: parent
                 anchors.margins: 14
-                spacing: 8
+                spacing: 10
 
                 // Header
                 RowLayout {
@@ -334,41 +420,43 @@ PluginComponent {
                     spacing: 8
 
                     Rectangle {
-                        width: 28
-                        height: 28
-                        radius: 14
+                        width: 30
+                        height: 30
+                        radius: 15
                         color: Theme.primaryContainer
+
                         Text {
                             anchors.centerIn: parent
                             text: "✦"
-                            font.pixelSize: 13
+                            font.pixelSize: 14
                             color: Theme.onPrimaryContainer
                         }
                     }
 
                     ColumnLayout {
-                        spacing: 0
+                        spacing: 1
                         Text {
                             text: "Gemini AI"
                             font.pixelSize: 14
-                            font.weight: Font.Bold
+                            font.weight: Font.DemiBold
                             color: Theme.onSurface
                         }
                         Text {
                             text: (root.configData && root.configData.model) ? root.configData.model : "gemini-3.6-flash"
                             font.pixelSize: 10
-                            color: Theme.onSurfaceVariant
+                            font.weight: Font.Medium
+                            color: Theme.primary
                         }
                     }
 
                     Item { Layout.fillWidth: true }
 
-                    // Maximize / Restore Toggle Button
+                    // Expand / Restore Button
                     Rectangle {
-                        width: 26
-                        height: 26
-                        radius: 13
-                        color: maxHover.hovered ? Theme.surfaceContainerHighest : "transparent"
+                        width: 28
+                        height: 28
+                        radius: 14
+                        color: expHover.hovered ? Theme.surfaceContainerHighest : "transparent"
 
                         Text {
                             anchors.centerIn: parent
@@ -377,7 +465,7 @@ PluginComponent {
                             color: Theme.onSurfaceVariant
                         }
 
-                        HoverHandler { id: maxHover }
+                        HoverHandler { id: expHover }
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
@@ -387,48 +475,51 @@ PluginComponent {
 
                     // Clear button
                     Rectangle {
-                        width: 26
-                        height: 26
-                        radius: 13
-                        color: clearHover.hovered ? Theme.surfaceContainerHighest : "transparent"
+                        width: 28
+                        height: 28
+                        radius: 14
+                        color: clrHover.hovered ? Theme.surfaceContainerHighest : "transparent"
 
                         Text {
                             anchors.centerIn: parent
                             text: "✕"
-                            font.pixelSize: 11
+                            font.pixelSize: 12
                             color: Theme.onSurfaceVariant
                         }
 
-                        HoverHandler { id: clearHover }
+                        HoverHandler { id: clrHover }
                         MouseArea {
                             anchors.fill: parent
                             cursorShape: Qt.PointingHandCursor
                             onClicked: {
                                 root.chatHistory = [];
                                 root.discardAttachment();
-                                root.hasUserResized = false;
+                                root.hasManualResize = false;
                             }
                         }
                     }
                 }
 
-                // Empty State Quick Prompts (Visible only when chat is empty)
+                // Empty State Quick Prompts
                 RowLayout {
                     visible: root.chatHistory.length === 0
                     Layout.fillWidth: true
-                    spacing: 6
+                    spacing: 8
 
                     Rectangle {
-                        height: 26
-                        radius: 13
-                        color: Theme.surfaceContainerHighest
-                        implicitWidth: qp1Text.implicitWidth + 16
+                        height: 28
+                        radius: 14
+                        color: Theme.surfaceContainerHigh
+                        border.color: Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.4)
+                        border.width: 1
+                        implicitWidth: qp1.implicitWidth + 18
 
                         Text {
-                            id: qp1Text
+                            id: qp1
                             anchors.centerIn: parent
                             text: "📸 Analyze Screen"
                             font.pixelSize: 11
+                            font.weight: Font.Medium
                             color: Theme.onSurface
                         }
                         MouseArea {
@@ -442,16 +533,19 @@ PluginComponent {
                     }
 
                     Rectangle {
-                        height: 26
-                        radius: 13
-                        color: Theme.surfaceContainerHighest
-                        implicitWidth: qp2Text.implicitWidth + 16
+                        height: 28
+                        radius: 14
+                        color: Theme.surfaceContainerHigh
+                        border.color: Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.4)
+                        border.width: 1
+                        implicitWidth: qp2.implicitWidth + 18
 
                         Text {
-                            id: qp2Text
+                            id: qp2
                             anchors.centerIn: parent
                             text: "📎 Inspect File"
                             font.pixelSize: 11
+                            font.weight: Font.Medium
                             color: Theme.onSurface
                         }
                         MouseArea {
@@ -462,19 +556,19 @@ PluginComponent {
                     }
                 }
 
-                // Chat Messages List (Grows dynamically as conversation happens)
+                // Chat Messages List
                 ListView {
-                    id: chatList
+                    id: chatView
                     visible: root.chatHistory.length > 0
                     Layout.fillWidth: true
                     Layout.fillHeight: true
                     clip: true
-                    spacing: 10
+                    spacing: 12
                     model: root.chatHistory
-                    onCountChanged: chatList.positionViewAtEnd()
+                    onCountChanged: chatView.positionViewAtEnd()
 
                     delegate: ColumnLayout {
-                        width: chatList.width
+                        width: chatView.width
                         spacing: 4
 
                         RowLayout {
@@ -482,28 +576,34 @@ PluginComponent {
                             layoutDirection: modelData.sender === "User" ? Qt.RightToLeft : Qt.LeftToRight
 
                             Rectangle {
-                                Layout.maximumWidth: chatList.width * 0.88
-                                radius: 14
-                                color: modelData.sender === "User" 
-                                       ? Theme.primary 
-                                       : (modelData.sender === "System" ? Theme.surfaceContainerHighest : Theme.surface)
-                                border.color: modelData.sender === "Gemini" ? Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.3) : "transparent"
+                                Layout.maximumWidth: chatView.width * 0.86
+                                radius: 16
+
+                                color: modelData.isError
+                                       ? Theme.errorContainer
+                                       : (modelData.sender === "User" 
+                                           ? Theme.primary 
+                                           : (modelData.sender === "System" ? Theme.surfaceContainerHigh : Theme.surfaceContainerHighest))
+
+                                border.color: modelData.isError
+                                              ? Theme.error
+                                              : (modelData.sender === "Gemini" ? Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.3) : "transparent")
                                 border.width: 1
-                                implicitWidth: Math.max(bubbleCol.implicitWidth + 24, modelData.attachment ? 200 : 60)
-                                implicitHeight: bubbleCol.implicitHeight + 20
+                                implicitWidth: Math.max(bubbleColumn.implicitWidth + 24, modelData.attachment ? 200 : 60)
+                                implicitHeight: bubbleColumn.implicitHeight + 20
 
                                 ColumnLayout {
-                                    id: bubbleCol
+                                    id: bubbleColumn
                                     anchors.fill: parent
                                     anchors.margins: 10
                                     spacing: 6
 
-                                    // Attachment Thumbnail/Chip inside bubble
+                                    // Attachment Display inside Bubble
                                     Rectangle {
                                         visible: !!modelData.attachment
                                         Layout.fillWidth: true
                                         implicitHeight: modelData.attachment && modelData.attachment.isImage ? 140 : 36
-                                        radius: 8
+                                        radius: 10
                                         color: Qt.rgba(0, 0, 0, 0.25)
                                         clip: true
 
@@ -518,7 +618,7 @@ PluginComponent {
                                         RowLayout {
                                             visible: !(modelData.attachment && modelData.attachment.isImage)
                                             anchors.fill: parent
-                                            anchors.margins: 6
+                                            anchors.margins: 8
                                             spacing: 6
 
                                             Text {
@@ -536,25 +636,26 @@ PluginComponent {
                                         }
                                     }
 
-                                    // Gemini Bubble Header with Copy Button
+                                    // Top Bar for Messages
                                     RowLayout {
-                                        visible: modelData.sender === "Gemini"
+                                        visible: modelData.sender !== "User"
                                         Layout.fillWidth: true
 
                                         Text {
-                                            text: "Gemini"
+                                            text: modelData.isError ? "⚠️ Error" : modelData.sender
                                             font.pixelSize: 10
                                             font.weight: Font.DemiBold
-                                            color: Theme.primary
+                                            color: modelData.isError ? Theme.onErrorContainer : (modelData.sender === "Gemini" ? Theme.primary : Theme.onSurfaceVariant)
                                         }
 
                                         Item { Layout.fillWidth: true }
 
                                         Rectangle {
+                                            visible: modelData.sender === "Gemini"
                                             width: 48
-                                            height: 18
-                                            radius: 9
-                                            color: copyHover.hovered ? Theme.primaryContainer : "transparent"
+                                            height: 20
+                                            radius: 10
+                                            color: copyHov.hovered ? Theme.primaryContainer : "transparent"
 
                                             Text {
                                                 anchors.centerIn: parent
@@ -564,7 +665,7 @@ PluginComponent {
                                                 color: root.copyFeedback === ("copied_" + index) ? Theme.primary : Theme.onSurfaceVariant
                                             }
 
-                                            HoverHandler { id: copyHover }
+                                            HoverHandler { id: copyHov }
                                             MouseArea {
                                                 anchors.fill: parent
                                                 cursorShape: Qt.PointingHandCursor
@@ -582,7 +683,9 @@ PluginComponent {
                                         text: modelData.text
                                         font.pixelSize: 12
                                         font.family: "Sans"
-                                        color: modelData.sender === "User" ? Theme.onPrimary : Theme.onSurface
+                                        color: modelData.isError 
+                                               ? Theme.onErrorContainer 
+                                               : (modelData.sender === "User" ? Theme.onPrimary : Theme.onSurface)
                                     }
                                 }
                             }
@@ -673,7 +776,6 @@ PluginComponent {
                             }
                         }
 
-                        // Remove attachment
                         Rectangle {
                             width: 26
                             height: 26
@@ -697,12 +799,13 @@ PluginComponent {
                     }
                 }
 
-                // Composer Input Bar
+                // Composer Input Capsule
                 Rectangle {
+                    id: composerCard
                     Layout.fillWidth: true
-                    height: 46
-                    radius: 23
-                    color: Theme.surfaceContainerHighest
+                    height: 48
+                    radius: 24
+                    color: Theme.surfaceContainerHigh
                     border.color: Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.4)
                     border.width: 1
 
@@ -710,14 +813,14 @@ PluginComponent {
                         anchors.fill: parent
                         anchors.leftMargin: 8
                         anchors.rightMargin: 6
-                        spacing: 6
+                        spacing: 4
 
-                        // Full Screen (📸)
+                        // Screenshot (📸)
                         Rectangle {
-                            width: 32
-                            height: 32
-                            radius: 16
-                            color: fullCamHover.hovered ? Theme.surfaceContainerHigh : "transparent"
+                            width: 34
+                            height: 34
+                            radius: 17
+                            color: camHover.hovered ? Theme.surfaceContainerHighest : "transparent"
 
                             Text {
                                 anchors.centerIn: parent
@@ -725,7 +828,7 @@ PluginComponent {
                                 font.pixelSize: 14
                             }
 
-                            HoverHandler { id: fullCamHover }
+                            HoverHandler { id: camHover }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
@@ -733,12 +836,12 @@ PluginComponent {
                             }
                         }
 
-                        // File Attachment (📎)
+                        // Attachment (📎)
                         Rectangle {
-                            width: 32
-                            height: 32
-                            radius: 16
-                            color: attachHover.hovered ? Theme.surfaceContainerHigh : "transparent"
+                            width: 34
+                            height: 34
+                            radius: 17
+                            color: attHover.hovered ? Theme.surfaceContainerHighest : "transparent"
 
                             Text {
                                 anchors.centerIn: parent
@@ -747,7 +850,7 @@ PluginComponent {
                                 color: Theme.onSurfaceVariant
                             }
 
-                            HoverHandler { id: attachHover }
+                            HoverHandler { id: attHover }
                             MouseArea {
                                 anchors.fill: parent
                                 cursorShape: Qt.PointingHandCursor
@@ -760,7 +863,8 @@ PluginComponent {
                             id: chatInput
                             Layout.fillWidth: true
                             placeholderText: root.hasAttachment ? ("Ask about " + root.attachedFileName + "...") : "Ask Gemini..."
-                            font.pixelSize: 12
+                            placeholderTextColor: Theme.onSurfaceVariant
+                            font.pixelSize: 13
                             color: Theme.onSurface
                             background: null
                             onAccepted: root.sendPrompt(chatInput)
@@ -768,16 +872,16 @@ PluginComponent {
 
                         // Send Button
                         Rectangle {
-                            width: 34
-                            height: 34
-                            radius: 17
-                            color: chatInput.text.trim() !== "" || root.hasAttachment ? Theme.primary : Theme.surfaceContainerLow
+                            width: 36
+                            height: 36
+                            radius: 18
+                            color: (chatInput.text.trim() !== "" || root.hasAttachment) ? Theme.primary : Theme.surfaceContainerHighest
 
                             Text {
                                 anchors.centerIn: parent
                                 text: "➤"
-                                font.pixelSize: 12
-                                color: chatInput.text.trim() !== "" || root.hasAttachment ? Theme.onPrimary : Theme.outline
+                                font.pixelSize: 13
+                                color: (chatInput.text.trim() !== "" || root.hasAttachment) ? Theme.onPrimary : Theme.outline
                             }
 
                             MouseArea {
@@ -791,12 +895,12 @@ PluginComponent {
                 }
             }
 
-            // Interactive Drag-to-Resize Corner Handle (Bottom-Right)
+            // Drag Resize Corner (Bottom-Right)
             Item {
                 anchors.right: parent.right
                 anchors.bottom: parent.bottom
-                width: 20
-                height: 20
+                width: 22
+                height: 22
 
                 Text {
                     anchors.centerIn: parent
@@ -812,15 +916,15 @@ PluginComponent {
 
                     onPressed: (mouse) => {
                         startPos = Qt.point(mouse.x, mouse.y);
-                        root.hasUserResized = true;
+                        root.hasManualResize = true;
                     }
 
                     onPositionChanged: (mouse) => {
                         var dx = mouse.x - startPos.x;
                         var dy = mouse.y - startPos.y;
 
-                        root.customWidth = Math.max(380, Math.min(950, cardContainer.implicitWidth + dx));
-                        root.customHeight = Math.max(220, Math.min(900, cardContainer.implicitHeight + dy));
+                        root.userWidth = Math.max(380, Math.min(960, mainCard.implicitWidth + dx));
+                        root.userHeight = Math.max(220, Math.min(900, mainCard.implicitHeight + dy));
                     }
                 }
             }
