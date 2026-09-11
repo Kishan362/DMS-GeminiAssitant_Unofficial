@@ -12,10 +12,10 @@ Installation is incredibly straightforward. Just download the folder and drop it
 ```
 bash
 # Clone the repository
-git clone [https://github.com/Kishan362/DMS-GeminiAssitant_Unofficial.git](https://github.com/Kishan362/DMS-GeminiAssitant_Unofficial.git)
+git clone [https://github.com/Kishan362/dms-geminiassitant.git](https://github.com/Kishan362/dms-geminiassitant.git)
 
 # Move it to the plugins directory
-mv DMS-GeminiAssitant_Unofficial ~/.config/DankMaterialShell/plugins/
+mv dms-geminiassitant ~/.config/DankMaterialShell/plugins/
 '''
 
 ##
